@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+
+import subprocess
+import os
+import time
+import argparse
+import re
+import signal
+import threading
+
+from enum import Enum
+from typing import Callable
+
+
+config_path = "/data/misc/perfetto-traces/perf.proto"
+perf_command = [
+    "adb",
+    "shell",
+    "perfetto",
+    "--txt",
+    "-o",
+    "/data/misc/perfetto-traces/trace",
+]
+
+basic_ftrace_events = [
+    'sched/*',
+    'task/task_newtask',
+    'task/task_rename',
+    'power/suspend_resume',
+    'ftrace/print'
+]
+
+basic_atrace_categories = [
+    'am',
+    'audio',
+    'binder_lock',
+    'binder_driver',
+    'bionic',
+    'gfx',
+    'hal',
+    'input',
+    'pm',
+    'video',
+    'view',
+    'webview',
+    'wm',
+]
+
+class DataSourceType(Enum):
+    PACKAGE_LIST = 1
+    PROCESS_STATS = 2
+    SYS_STATS = 3
+    LOG = 4
+    FTRACE = 5
+
+
+class DataSourceBuilder:
+    def __init__(self, data_source_type, params):
+        self.data_source_type = data_source_type
+        self.data_source = ""
+        self.params = params
+        self.builder_map = {
+            DataSourceType.PACKAGE_LIST: self._build_package_list,
+            DataSourceType.PROCESS_STATS: self._build_package_stats,
+            DataSourceType.SYS_STATS: self._build_sys_stats,
+            DataSourceType.LOG: self._build_log,
+            DataSourceType.FTRACE: self._build_ftrace,
+        }
+
+    def _build_package_list(self):
+        return """data_sources: {
+    config {
+        name: "android.packages_list"
+        target_buffer: 1
+    }
+}
+"""
+
+    def _build_package_stats(self):
+        return """data_sources: {
+    config {
+        name: "linux.process_stats"
+        target_buffer: 1
+        process_stats_config {
+            scan_all_processes_on_start: true
+        }
+    }
+}
+"""
+
+    def _build_sys_stats(self):
+        return """data_sources: {
+    config {
+        name: "linux.sys_stats"
+        sys_stats_config {
+            stat_period_ms: 500
+            meminfo_period_ms: 500
+        }
+    }
+}
+"""
+
+    def _build_log(self):
+        return """data_sources: {
+    config {
+        name: "android.log"
+        android_log_config {
+            log_ids: LID_DEFAULT
+            log_ids: LID_SYSTEM
+            log_ids: LID_KERNEL
+        }
+    }
+}
+"""
+
+    def _build_ftrace(self):
+        ftrace_events = self.params.get("ftrace_events", [])
+        atrace_categories = self.params.get("atrace_categories", [])
+        app_name = self.params.get("app_name", "")
+
+        ftrace_string = ""
+        for event in ftrace_events:
+            ftrace_string += " " * 12 + 'ftrace_events: "%s"\n' % event
+
+        for category in atrace_categories:
+            ftrace_string += " " * 12 + 'atrace_categories: "%s"\n' % category
+
+        ftrace_string += " " * 12 + 'atrace_apps: "%s"\n' % app_name
+
+        return (
+            """data_sources {
+    config {
+        name: "linux.ftrace"
+        ftrace_config {
+%s
+        }
+    }
+}
+"""
+            % ftrace_string
+        )
+
+    def build(self):
+        return self.builder_map[self.data_source_type]()
+
+
+class ConfigComposer:
+    main_buffer_size = 0
+    app_name = ""
+    enable_logcat = True
+    enable_memory_profiling = False
+    ftrace_events = basic_ftrace_events
+    atrace_categories = basic_atrace_categories
+
+    duration_ms = None
+    file_write_period_ms = None
+    flush_period_ms = 5000
+
+    def __init__(self):
+        pass
+
+    def set_main_buffer_size(self, size):
+        self.main_buffer_size = size
+        return self
+
+    def set_app_name(self, name):
+        self.app_name = name
+        return self
+
+    def set_enable_logcat(self, enable):
+        self.enable_logcat = enable
+        return self
+
+    def set_flush_period_ms(self, period):
+        self.flush_period_ms = period
+        return self
+    
+    def set_duration_ms(self, duration):
+        self.duration_ms = duration
+        return self
+    
+    def set_file_write_period_ms(self, period):
+        self.file_write_period_ms = period
+        return self
+
+    def add_ftrace_event(self, event):
+        self.ftrace_events.append(event)
+        return self
+
+    def add_atrace_category(self, category):
+        self.atrace_categories.append(category)
+        return self
+
+    def set_enable_memory_profiling(self, enable):
+        self.ftrace_events.extend([
+            'kmem/rss_stat',
+            'mm_event/mm_event_record'
+        ])
+        self.enable_memory_profiling = enable 
+
+    def _build_buffers_block(self, buffer_size):
+        return (
+            """buffers {
+    size_kb: %d
+    fill_policy: RING_BUFFER
+}
+"""
+            % buffer_size
+        )
+    
+    def _build_java_heap_block(self):
+        return (
+            """data_sources: {
+    config {
+        name: "android.java_hprof
+        java_hprof_config {
+            process_cmdline: "%s"
+            dump_smaps: true
+        }
+    }
+}""" % self.app_name
+        )
+
+    def build(self):
+        config = ""
+
+        self.main_buffer_size = self.main_buffer_size or 1024
+
+        config += self._build_buffers_block(self.main_buffer_size)
+        config += self._build_buffers_block(4096)  # store package stats information
+
+        # default data sources
+        config += DataSourceBuilder(DataSourceType.PACKAGE_LIST, {}).build()
+        config += DataSourceBuilder(DataSourceType.PROCESS_STATS, {}).build()
+        config += DataSourceBuilder(DataSourceType.SYS_STATS, {}).build()
+
+        if self.enable_logcat:
+            config += DataSourceBuilder(DataSourceType.LOG, {}).build()
+
+        if self.ftrace_events or self.atrace_categories:
+            config += DataSourceBuilder(
+                DataSourceType.FTRACE,
+                {
+                    "ftrace_events": self.ftrace_events,
+                    "atrace_categories": self.atrace_categories,
+                    "app_name": self.app_name,
+                },
+            ).build()
+
+        config += "\nwrite_into_file: true"
+        config += "\nflush_period_ms: %d" % self.flush_period_ms
+        if self.duration_ms:
+            config += "\nduration_ms: %d" % self.duration_ms
+        if self.file_write_period_ms:
+            config += "\nfile_write_period_ms: %d" % self.file_write_period_ms
+        
+        if self.enable_memory_profiling:
+            config += self._build_java_heap_block()
+            
+        return config
+
+
+def get_next_file_name(prefix):
+    i = 0
+    while True:
+        file_name = f"{prefix}{i}"
+        if not os.path.exists(file_name):
+            return file_name
+        i += 1
+
+
+class MediaCodecLoggerInfo:
+    def __init__(
+        self, codec: str, frames_dropped: int, resolution: tuple, framerate: float
+    ):
+        self.codec_type = codec
+        self.resolution = resolution
+        self.stream_framerate = framerate
+        self.frames_dropped = frames_dropped
+
+    def __str__(self) -> str:
+        return f"Codec Type: {self.codec_type}\nResolution: {self.resolution}\nStream Framerate: {self.stream_framerate}\nFramesDropped: {self.frames_dropped}"
+
+    def diff_str(self, info) -> str:
+        diff = ""
+        if self.codec_type != info.codec_type:
+            diff += f"Codec change: {self.codec_type} -> {info.codec_type}\n"
+        if self.resolution != info.resolution:
+            diff += f"Resolution change: {self.resolution} -> {info.resolution}\n"
+        if self.stream_framerate != info.stream_framerate:
+            diff += f"Stream Framerate change: {self.stream_framerate} -> {info.stream_framerate}\n"
+        if self.frames_dropped != info.frames_dropped:
+            diff += f"FramesDropped change: {self.frames_dropped} -> {info.frames_dropped}\n"
+        return diff
+
+    def valid(self) -> bool:
+        return not self.frames_dropped is None  # The least information to be valid
+
+
+def getMediaCodecInfo() -> MediaCodecLoggerInfo:
+    dump = subprocess.run(
+        "adb shell dumpsys amazon_media_codec_logger",
+        shell=True,
+        text=True,
+        capture_output=True,
+    )
+    info = MediaCodecLoggerInfo(None, None, None, None)
+    if dump.returncode != 0:
+        print("[FrameDrop] Failed to get frame drop info")
+        return info
+
+    clients = dump.stdout.split("Client [")
+    for out in clients:
+        if "Codec Type: VIDEO" not in out:
+            continue
+
+        m = re.search(r"FramesDropped: (\d+)", out)
+        if m:
+            info.frames_dropped = int(m.group(1))
+
+        m = re.search(r"Resolution: (\d+)x(\d+)", out)
+        if m:
+            info.resolution = (int(m.group(1)), int(m.group(2)))
+        m = re.search(r"Stream Framerate \(fps\): ([\d\.]+)", out)
+        if m:
+            info.stream_framerate = float(m.group(1))
+        m = re.search(r"Format: (\S+)", out)
+        if m:
+            info.codec_type = m.group(1)
+
+    return info
+
+
+def add_common_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-a",
+        "--app_name",
+        type=str,
+        default="mediaserver",
+        help="The name of the app to profile",
+    )
+    parser.add_argument(
+        "-p",
+        "--prefix",
+        type=str,
+        default="trace_",
+        help="Prefix of the output file, the output file will be {prefix}_{i}",
+    )
+    parser.add_argument(
+        "-f",
+        "--flush_period_ms",
+        type=int,
+        default=5000,
+        help="The flush period of the perfetto",
+    )
+    parser.add_argument(
+        "-o",
+        "--open_in_browser",
+        action="store_true",
+        default=False,
+        help="Open the trace in browser, open_trace_in_ui must be in the PATH",
+    )
+    parser.add_argument(
+        "-m",
+        "--memory",
+        action="store_true",
+        default=False,
+        help="Enable memory profiling",
+    )
+
+
+def add_root_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-b",
+        "--buffer_size_kb",
+        type=int,
+        default=1000000,
+        help="The buffer size of the perfetto",
+    )
+    parser.add_argument(
+        "-d",
+        "--duration",
+        type=float,
+        default=10.0,
+        help="The time to run the perfetto, in seconds",
+    )
+    parser.add_argument(
+        "-ws",
+        "--file_write_period_ms",
+        type=int,
+        default=5000,
+        help="The file write period of the perfetto",
+    )
+
+
+def add_async_mode_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-e",
+        "--event",
+        type=str,
+        default="",
+        help="The event to trigger stopping the perfetto. Available events: frame_drop, log_keyword. Default value will be guessed based on other arguments",
+    )
+        
+    parser.add_argument(
+        "-b",
+        "--buffer_size_kb",
+        type=int,
+        default=100000,  # 100MB, no need to be that large in detach mode
+        help="The buffer size of the perfetto. This will be size of the utimate output file, so keep it small. According to experience, 1 second of trace is about 2-3MB",
+    )
+    parser.add_argument(
+        "-dl",
+        "--delay_seconds",
+        type=float,
+        default=3.0,
+        help="Seconds to delay after the event is triggered and before stopping the perfetto",
+    )
+    
+    # Frame drop
+    parser.add_argument(
+        "-w",
+        "--window-size",
+        type=int,
+        default=10,
+        help="The window size to detect frame drop",
+    )
+    parser.add_argument(
+        "-t",
+        "--threshold",
+        type=int,
+        default=5,
+        help="The threshold to detect frame drop",
+    )
+
+    # Log keyword
+    parser.add_argument(
+        "-k",
+        "--keyword",
+        type=str,
+        help="The keyword to trigger stopping the perfetto",
+    )
+
+
+def push_config_file(config: str) -> bool:
+    with open("/tmp/tmp_config", "w") as f:
+        f.write(config)
+    command = f"adb push /tmp/tmp_config {config_path}"
+    proc = subprocess.run(command, shell=True, capture_output=True)
+    if proc.returncode != 0:
+        print(f"Failed to push config file: {proc.stderr}")
+        return False
+    return True
+
+
+def start_regular_profiling(args: argparse.Namespace):
+    duration_ms = int(args.duration * 1000)
+    prefix = args.prefix
+
+    config = (
+        ConfigComposer()
+            .set_main_buffer_size(args.buffer_size_kb)
+            .set_app_name(args.app_name)
+            .set_flush_period_ms(args.flush_period_ms)
+            .set_duration_ms(duration_ms)
+            .set_file_write_period_ms(args.file_write_period_ms)
+            .build()
+    )
+
+    if not push_config_file(config):
+        return
+
+    output = get_next_file_name(prefix)
+    print(
+        f"Profiling {args.app_name} for {duration_ms/1000} seconds, output to {output}"
+    )
+
+    perf_command.extend(["-c", config_path])
+    perfetto = subprocess.Popen(perf_command, text=True)
+    time.sleep(1)  # Wait for perfetto to start
+
+    for i in range(duration_ms // 1000):
+        print(f"{duration_ms//1000 - i} seconds left")
+        time.sleep(1)
+
+    print("Waiting for perfetto to finish")
+
+    # wait for perfetto to finish
+    perfetto.wait()
+
+    subprocess.run(f"adb pull /data/misc/perfetto-traces/trace {output}", shell=True)
+    print(f"Trace saved to {output}")
+    if args.open_in_browser:
+        subprocess.run(f"open_trace_in_ui {output}", shell=True)
+
+
+class AsyncPerfettoResult:
+    should_stop_hit = False
+    user_cancelled = False
+    error = ''
+    
+    def __init__(self, should_stop_hit=False, user_cancelled=False, error=''):
+        self.should_stop_hit = should_stop_hit
+        self.user_cancelled = user_cancelled
+        self.error = error
+    
+def run_perfetto_asyncly(config: str, should_stop: Callable[[], bool]) -> AsyncPerfettoResult:
+    session_id = "frame_drop"
+    if not push_config_file(config):
+        return AsyncPerfettoResult(error="Failed to push config file")
+    
+    perf_command.extend(["-c", config_path, f"--detach={session_id}"])
+    print(f'perf_command: {perf_command}')
+    perfetto = subprocess.Popen(perf_command, text=True)
+    perfetto.wait()  # detach mode should exit immediately
+    
+    def end_perfetto():
+        stop_perf_cmd = ["adb", "shell", "perfetto", f"--attach={session_id}", "--stop"]
+        stop_process = subprocess.Popen(stop_perf_cmd)
+        stop_process.wait()
+    
+    def signal_handler(sig, frame):
+        print("Manual cancellation detected. Stopping profiling...")
+        end_perfetto()
+        print("Profiling stopped")
+        exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    while True:
+        print('')
+        print('---')
+        print(f'Running perfetto in detach mode, current time: {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
+    
+        if should_stop():
+            print('Stop condition hit, stopping perfetto...')
+            end_perfetto()
+            return AsyncPerfettoResult(should_stop_hit=True)
+        
+        time.sleep(1)
+    
+
+class DetachPerfettoHandler:
+    def __init__(self):
+        pass
+    def should_stop(self):
+        raise NotImplementedError()
+    def on_stopped(self):
+        pass
+
+class FrameDropHandler(DetachPerfettoHandler):
+    def __init__(self, window_size, threshold):
+        self.window_size = window_size
+        self.threshold = threshold
+        self.last_codec_info = getMediaCodecInfo()
+        self.last_check_time = time.time()
+        if not self.last_codec_info.valid():
+            print("[FrameDrop] Failed to get initial codec info")
+            raise Exception("Failed to get initial codec info")
+        print(
+            f"Profiling frame drop, detect drop every {window_size}s, threshold: {threshold}"
+        )
+    
+    def should_stop(self):
+        if time.time() - self.last_check_time < self.window_size:
+            return False
+        codec_info = getMediaCodecInfo()
+        if not codec_info.valid():
+            print("[FrameDrop] Failed to get codec info")
+            return True
+        print(f"New codec status:\n{codec_info}")
+        diff = self.last_codec_info.diff_str(codec_info)
+        if diff:
+            print(f"Codec status changed:\n{diff}")
+        if codec_info.frames_dropped - self.last_codec_info.frames_dropped >= self.threshold:
+            print(
+                f"Frame drop detected, diff: {codec_info.frames_dropped - self.last_codec_info.frames_dropped}"
+            )
+            return True
+        self.last_codec_info = codec_info
+        return False
+    
+    def on_stopped(self):
+        print("Frame drop handler stopped")
+
+class LogcatKeywordHandler(DetachPerfettoHandler):
+    def __init__(self, keyword):
+        self.keyword = keyword
+        self.keyword_hit = False
+        self.lock = threading.Lock()
+        self.logcat_thread = threading.Thread(target=self.logcat_thread_fun)
+        self.logcat_thread.start()
+        
+    def logcat_thread_fun(self):
+        checked_lines = 0
+        subprocess.run(["adb", "logcat", "-c"], text=True)
+        logcat = subprocess.Popen(
+            ["adb", "logcat"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        for line in logcat.stdout:
+            checked_lines += 1
+            if checked_lines % 5000 == 0:
+                print(f"Checked {checked_lines} lines")
+            if self.keyword in line:
+                print(f"Keyword hit: {self.keyword}, line: {line}")
+                with self.lock:
+                    self.keyword_hit = True
+                    break
+        logcat.kill() 
+
+    def should_stop(self):
+        with self.lock:
+            return self.keyword_hit
+    
+    def on_stopped(self):
+        print("Logcat keyword handler stopped")
+        if self.logcat_thread.is_alive():
+            self.logcat_thread.join()
+
+
+def make_handler(args: argparse.Namespace) -> DetachPerfettoHandler:
+    if args.event == "frame_drop":
+        return FrameDropHandler(args.window_size, args.threshold)
+    elif args.event == "log_keyword":
+        return LogcatKeywordHandler(args.keyword)
+    else:
+        raise Exception(f"Unknown event: {args.event}")
+
+
+def start_detach_profiling(args: argparse.Namespace) -> None:
+    handler = make_handler(args)
+    
+    config = (
+        ConfigComposer()
+            .set_main_buffer_size(args.buffer_size_kb)
+            .set_app_name(args.app_name)
+            .set_flush_period_ms(args.flush_period_ms)
+            .set_file_write_period_ms(1000000000)
+            .build()
+    )
+
+    def should_stop():
+        return handler.should_stop()
+
+    result = run_perfetto_asyncly(config, should_stop)
+
+    if result.should_stop_hit:
+        output = get_next_file_name(args.prefix)
+        time.sleep(args.delay_seconds)
+        subprocess.run(
+            f"adb pull /data/misc/perfetto-traces/trace {output}", shell=True
+        )
+        print(f"Trace saved to {output}")
+        if args.open_in_browser:
+            subprocess.run(f"open_trace_in_ui {output}", shell=True)
+    elif result.error:
+        print(f"Error: {result.error}")
+
+    handler.on_stopped()
+    
+
+def main():
+    parser = argparse.ArgumentParser(description="Run perfetto on Android devices")
+    subcommands = parser.add_subparsers(dest="subcommand")
+    add_common_parser(parser)
+    add_root_parser(parser)
+
+    async_cmd = subcommands.add_parser(
+        "detach",
+        help="Run in detach mode, trigger stopping by certain events",
+    )
+    add_common_parser(async_cmd)
+    add_async_mode_parser(async_cmd)
+
+    args = parser.parse_args()
+
+    if args.subcommand == "detach":
+        print(f"Running detach command")
+        
+        if not args.event:
+            print("Event not specified, guessing based on other arguments")
+            if args.keyword:
+                args.event = "log_keyword"
+            elif args.window_size and args.threshold:
+                args.event = "frame_drop"
+            else:
+                raise Exception("Event not specified and cannot be guessed. '-k' for log_keyword, '-w' and '-t' for frame_drop")
+            
+        start_detach_profiling(args)
+    else:
+        print(f"Running regular command")
+        start_regular_profiling(args)
+
+
+if __name__ == "__main__":
+    main()
