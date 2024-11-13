@@ -1,14 +1,15 @@
 # PerfSets
 
 It's a toolset to help dealing with `perfetto` tools:
-- arrage config parameters of `perfetto`;
-- start `perfetto` tracing with the config and in different modes;
-- stop `perfetto` by triggering specific events, such as logcat keywords, or frame drops;
-- pull the trace file from the device;
-- open trace files in the browser.
+- Automate executing & managing perfetto tracing sessions;
+- Enhanced post process functions of tracing files;
 
-## Usage
-### perf script
+## perf
+- Run perfetto tracing on an Android device.
+- Collect tracing results from the device.
+- Support detach mode and stop tracing by specific events
+
+### Usage
 Regular mode: record a trace file in a specific duration.
 
 ```
@@ -72,5 +73,44 @@ options:
                         The keyword to trigger stopping the perfetto
 ```
 
+## draw_cpu
+Calculate and visualize CPU load from Perfetto trace files.
+
+### Installation
+
+Ensure you have Python 3.6 or higher installed. Install the required dependencies using `pip`:
+
+```bash
+python3 -m pip install pandas tqdm matplotlib perfetto-trace-processor
+```
+
+Install `trace_processor_shell` from the github release page: https://github.com/google/perfetto/releases.
+
+Download the latest release package according to your platform, extract all files and path of the `trace_process_shell` will be passed to the script later.
+
+### Usage
+Run the `draw_cpu.py` script with the necessary arguments:
+
+Options:
+
+- `-f`, `--file`: Absolute path to the trace file. (Required)
+- `-b`, `--binary`: Absolute path to the trace processor binary. (Required)
+- `--window_size_ms`: Window size in milliseconds. If not provided, it is automatically calculated to have approximately 200 points.
+- `--window_move_ms`: Window move (step) in milliseconds. If not provided, it is calculated based on the window size.
+- `--output`: Base path to save the CPU load DataFrames as CSV files. (Optional)
+Example:
+```bash
+python3 draw_cpu.py -f example/example.pb -b /path/to/trace_processor_shell
+```
+Example output:
+![example output](media/example.png)
+
+### Caveats
+- **Trace File**: Ensure that the trace file is recorded with `sched/sched_switch` and `sched/sched_wakeup` categories enabled.
+- **Trace Processor Binary**: Ensure that the trace processor binary path provided with the -b option is correct and executable.
+- **Performance**: Processing very large trace files may consume significant memory and processing time.
+- **Visualization**: Installing matplotlib is optional but required if you want to visualize the CPU load curves. If not installed, the script will skip the plotting step.
+- **CPU Load Capping**: The script caps CPU load percentage at 100% to avoid unrealistic values.
+
 ## Todo
-- [ ] `cpu_load.sql`: a script to calculate the CPU load of the trace file
+- [ ] `draw_cpu.py`: accelerate calculations by employing multi-threading.
