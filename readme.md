@@ -1,8 +1,9 @@
 # PerfSets
 
 It's a toolset to help dealing with `perfetto` tools:
-- Automate executing & managing perfetto tracing sessions;
-- Enhanced post process functions of tracing files;
+- Automate executing & managing perfetto tracing sessions: [perf](#perf);
+- Enhanced post process functions of tracing files: [draw_cpu](#draw_cpu);
+- Extract logcat from a perfetto trace file that recorded with `logcat` data source enabled: [extract_logcat](#extract_logcat).
 
 ## perf
 - Run perfetto tracing on an Android device.
@@ -111,6 +112,21 @@ Example output:
 - **Performance**: Processing very large trace files may consume significant memory and processing time.
 - **Visualization**: Installing matplotlib is optional but required if you want to visualize the CPU load curves. If not installed, the script will skip the plotting step.
 - **CPU Load Capping**: The script caps CPU load percentage at 100% to avoid unrealistic values.
+
+## extract_logcat
+
+Extract logcat from a perfetto trace file that recorded with `logcat` data source enabled.
+
+### Installation
+
+See the installation instructions for `draw_cpu`.
+
+### Usage
+
+Run the `extract_logcat.py` script with the necessary arguments:
+```bash
+python3 extract_logcat.py -f example/example.pb -b /path/to/trace_processor_shell -o output.log
+```
 
 ## Todo
 - [ ] `draw_cpu.py`: accelerate calculations by employing multi-threading.
