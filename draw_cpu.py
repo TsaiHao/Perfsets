@@ -40,13 +40,13 @@ def calculate_cpu_load_sliding_window_base(
     # Generate window start times
     num_windows = (
         int(math.ceil((total_duration_ns - window_size_ns) / window_move_ns)) + 1
-    )
+    ) - 4       # Last 4 windows are not accurate
     window_start_ns = [i * window_move_ns for i in range(num_windows)]
 
     # Initialize list to store CPU load per window
     cpu_loads = []
 
-    def calculate_load_percentage(slice_df, start_ns, end_ns):
+    def calculate_load_percentage(slice_df, start_ns, end_ns, num_cpus):
         overlapping = slice_df[
             (slice_df["ts_ns"] < end_ns)
             & ((slice_df["ts_ns"] + slice_df["dur"]) > start_ns)
@@ -72,7 +72,7 @@ def calculate_cpu_load_sliding_window_base(
 
     if per_core:
         cpu_list = sorted(df["ucpu"].unique())
-        for i, ucpu in enumerate(cpu_list):
+        for ucpu in cpu_list:
             if progress_bar:
                 window_iter = tqdm(
                     window_start_ns, desc=f"Calculating CPU {ucpu} Load", unit="win"
@@ -84,7 +84,7 @@ def calculate_cpu_load_sliding_window_base(
                 cpu_slices = df[df["ucpu"] == ucpu]
 
                 cpu_load_percentage = calculate_load_percentage(
-                    cpu_slices, start_ns, end_ns
+                    cpu_slices, start_ns, end_ns, 1
                 )
 
                 cpu_loads.append(
@@ -101,7 +101,7 @@ def calculate_cpu_load_sliding_window_base(
             window_iter = window_start_ns
         for start_ns in window_iter:
             end_ns = start_ns + window_size_ns
-            cpu_load_percentage = calculate_load_percentage(df, start_ns, end_ns)
+            cpu_load_percentage = calculate_load_percentage(df, start_ns, end_ns, num_cpus)
             cpu_loads.append(
                 {
                     "window_start_ms": start_ns / 1_000_000,
@@ -170,6 +170,7 @@ def main():
     # Initialize TraceProcessor
     config = TraceProcessorConfig(bin_path=args.binary)
     try:
+        print('Loading trace...')
         processor = TraceProcessor(trace=args.file, config=config)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize TraceProcessor: {e}")
