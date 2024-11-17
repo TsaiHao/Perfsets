@@ -7,111 +7,7 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from tqdm import tqdm  # Ensure tqdm is installed
 
-
-def calculate_cpu_load_sliding_window_base(
-    df: pd.DataFrame,
-    window_size_ns: int,
-    window_move_ns: int,
-    num_cpus=None,
-    per_core=False,
-    progress_bar=None,
-):
-    """
-    Calculate CPU load using a sliding window approach.
-
-    Parameters:
-    - df (pd.DataFrame): DataFrame containing running slices with columns ['ts_ns', 'dur', 'ucpu']
-    - window_size_ns (int): Size of the window in nanoseconds.
-    - window_move_ns (int): Step size to move the window in nanoseconds.
-    - num_cpus (int): Number of unique CPU cores (required if per_core is False).
-    - per_core (bool): Whether to calculate per-core CPU load.
-    - progress_bar (tqdm.tqdm): Progress bar instance.
-
-    Returns:
-    - pd.DataFrame: DataFrame with window start time (ms) and CPU load percentage.
-    """
-    # Determine trace duration
-    trace_end_ns = df["ts_end_ns"].max()
-    trace_start_ns = df["ts_ns"].min()
-
-    # Total trace duration
-    total_duration_ns = trace_end_ns - trace_start_ns
-
-    # Generate window start times
-    num_windows = (
-        int(math.ceil((total_duration_ns - window_size_ns) / window_move_ns)) + 1
-    ) - 4       # Last 4 windows are not accurate
-    window_start_ns = [i * window_move_ns for i in range(num_windows)]
-
-    # Initialize list to store CPU load per window
-    cpu_loads = []
-
-    def calculate_load_percentage(slice_df, start_ns, end_ns, num_cpus):
-        overlapping = slice_df[
-            (slice_df["ts_ns"] < end_ns)
-            & (slice_df["ts_end_ns"] > start_ns)
-        ]
-        if overlapping.empty:
-            return 0
-        else:
-            overlapping = overlapping.copy()
-            overlapping["effective_start_ns"] = overlapping["ts_ns"].clip(
-                lower=start_ns
-            )
-            overlapping["effective_end_ns"] = (
-                overlapping["ts_end_ns"]
-            ).clip(upper=end_ns)
-            overlapping["overlap_ns"] = (
-                overlapping["effective_end_ns"] - overlapping["effective_start_ns"]
-            )
-            overlapping["overlap_ns"] = overlapping["overlap_ns"].clip(lower=0)
-            total_running_ns = overlapping["overlap_ns"].sum()
-        cpu_load_percentage = (total_running_ns / (num_cpus * window_size_ns)) * 100
-        cpu_load_percentage = min(cpu_load_percentage, 100.0)
-        return cpu_load_percentage
-
-    if per_core:
-        cpu_list = sorted(df["ucpu"].unique())
-        for ucpu in cpu_list:
-            if progress_bar:
-                window_iter = tqdm(
-                    window_start_ns, desc=f"Calculating CPU {ucpu} Load", unit="win"
-                )
-            else:
-                window_iter = window_start_ns
-            for start_ns in window_iter:
-                end_ns = start_ns + window_size_ns
-                cpu_slices = df[df["ucpu"] == ucpu]
-
-                cpu_load_percentage = calculate_load_percentage(
-                    cpu_slices, start_ns, end_ns, 1
-                )
-
-                cpu_loads.append(
-                    {
-                        "window_start_ms": start_ns / 1_000_000,
-                        "ucpu": ucpu,
-                        "cpu_load_percentage": cpu_load_percentage,
-                    }
-                )
-    else:
-        if progress_bar:
-            window_iter = tqdm(window_start_ns, desc="Calculating CPU Load", unit="win")
-        else:
-            window_iter = window_start_ns
-        for start_ns in window_iter:
-            end_ns = start_ns + window_size_ns
-            cpu_load_percentage = calculate_load_percentage(df, start_ns, end_ns, num_cpus)
-            cpu_loads.append(
-                {
-                    "window_start_ms": start_ns / 1_000_000,
-                    "cpu_load_percentage": cpu_load_percentage,
-                }
-            )
-
-    cpu_load_df = pd.DataFrame(cpu_loads)
-    return cpu_load_df
-
+from cmake_example import calculate_cpu_load 
 
 def calculate_dynamic_window_params(total_duration_ns, desired_points=200):
     """
@@ -176,7 +72,7 @@ def main():
         raise RuntimeError(f"Failed to initialize TraceProcessor: {e}")
 
     sql_path = os.path.join(
-        os.path.dirname(__file__), "sql", "thread_running_slices.sql"
+        os.path.dirname(__file__), "..", "sql", "thread_running_slices.sql"
     )
     with open(sql_path, "r") as f:
         query = f.read()
@@ -204,7 +100,7 @@ def main():
     # Determine trace duration
     trace_end_ns = df["ts_end_ns"].max()
     trace_start_ns = df["ts_ns"].min()
-    total_duration_ns = trace_end_ns - trace_start_ns
+    total_duration_ns = trace_end_ns 
 
     # Check for excessively large durations
     max_windows = 2000
@@ -250,31 +146,22 @@ def main():
 
     # Calculate overall CPU load using sliding window with progress bar
     print("\nCalculating overall CPU load...")
-    cpu_load_df = calculate_cpu_load_sliding_window_base(
-        df,
-        window_size_ns=window_size_ns,
-        window_move_ns=window_move_ns,
-        num_cpus=num_cpus,
-        per_core=False,
-        progress_bar=True,
-    )
-    print("Overall CPU Load Data Frame:")
-    print(cpu_load_df.head())
+    slice_start_ns_list = df["ts_ns"].tolist()
+    slice_end_ns_list = df["ts_end_ns"].tolist()
+    slice_ucpu_list = df["ucpu"].tolist()
 
-    # Calculate per-CPU load using sliding window with progress bar
-    print("\nCalculating per-CPU load...")
-    cpu_load_per_core_df = calculate_cpu_load_sliding_window_base(
-        df,
-        window_size_ns=window_size_ns,
-        window_move_ns=window_move_ns,
-        num_cpus=num_cpus,
-        per_core=True,
-        progress_bar=True,
+    cpu_load = calculate_cpu_load(
+            slice_start_ns_list,
+            slice_end_ns_list,
+            slice_ucpu_list,
+            total_duration_ns,
+            window_size_ns,
+            window_move_ns,
     )
-    print("Per-CPU Load Data Frame:")
-    print(cpu_load_per_core_df.head())
 
-    # Optionally save the CPU load DataFrames to CSV files
+    print(f'len of cpu_load: {len(cpu_load)}')
+    print(f'len of cpu_load[0]: {len(cpu_load[0])}')
+
     if args.output:
         try:
             # Ensure the output directory exists
@@ -294,7 +181,6 @@ def main():
         except Exception as e:
             print(f"Failed to save CSV files: {e}")
 
-    # Optionally, plot the CPU load curves
     try:
         import matplotlib.pyplot as plt
 
@@ -303,8 +189,8 @@ def main():
 
         # Plot Overall CPU Load
         axs[0].plot(
-            cpu_load_df["window_start_ms"],
-            cpu_load_df["cpu_load_percentage"],
+            #cpu_load_df["window_start_ms"],
+            cpu_load[-1],
             marker="o",
             linestyle="-",
             color="blue",
@@ -315,11 +201,10 @@ def main():
         axs[0].grid(True)
 
         # Plot Per-CPU Load
-        for ucpu in sorted(cpu_load_per_core_df["ucpu"].unique()):
-            core_data = cpu_load_per_core_df[cpu_load_per_core_df["ucpu"] == ucpu]
+        for ucpu in range(num_cpus):
             axs[1].plot(
-                core_data["window_start_ms"],
-                core_data["cpu_load_percentage"],
+                #core_data["window_start_ms"],
+                cpu_load[ucpu],
                 marker="o",
                 linestyle="-",
                 label=f"CPU {ucpu}",
