@@ -1,0 +1,5 @@
+/.vscode
+/.idea
+/build
+/cpu_load_plugin.egg-info
+compile_commands.json

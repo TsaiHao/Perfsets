@@ -1,4 +1,5 @@
 import os
+import time
 import argparse
 import math
 
@@ -7,7 +8,9 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from tqdm import tqdm  # Ensure tqdm is installed
 
-from cmake_example import calculate_cpu_load 
+# Install c++ plugin with:
+#  python3 -m pip install .
+from cpu_load_plugin import calculate_cpu_load 
 
 def calculate_dynamic_window_params(total_duration_ns, desired_points=200):
     """
@@ -42,6 +45,12 @@ def main():
         help="Absolute path to a trace processor binary",
         type=str,
         required=True,
+    )
+    parser.add_argument(
+        "-p",
+        "--plot",
+        help="Plot the CPU load curves using matplotlib (optional)",
+        action="store_true",
     )
     parser.add_argument(
         "--window_size_ms",
@@ -83,14 +92,14 @@ def main():
     except Exception as e:
         processor.close()
         raise RuntimeError(f"Failed to execute SQL query: {e}")
+    
+    # Close the TraceProcessor
+    processor.close()
 
     print("Queried data frame: ")
     print("  size: ", df.shape)
     print("  columns: ", df.columns)
     print("  head: ", df.head())
-
-    # Close the TraceProcessor
-    processor.close()
 
     # Validate necessary columns
     required_columns = {"ts_ns", "ts_end_ns", "ucpu"}
@@ -99,8 +108,7 @@ def main():
 
     # Determine trace duration
     trace_end_ns = df["ts_end_ns"].max()
-    trace_start_ns = df["ts_ns"].min()
-    total_duration_ns = trace_end_ns 
+    total_duration_ns = trace_end_ns
 
     # Check for excessively large durations
     max_windows = 2000
@@ -146,6 +154,7 @@ def main():
 
     # Calculate overall CPU load using sliding window with progress bar
     print("\nCalculating overall CPU load...")
+    start = time.time()
     slice_start_ns_list = df["ts_ns"].tolist()
     slice_end_ns_list = df["ts_end_ns"].tolist()
     slice_ucpu_list = df["ucpu"].tolist()
@@ -158,6 +167,9 @@ def main():
             window_size_ns,
             window_move_ns,
     )
+    timestamp = cpu_load[-1]
+    end = time.time()
+    print(f'Overall CPU load calculation took {end - start:.2f} seconds')
 
     print(f'len of cpu_load: {len(cpu_load)}')
     print(f'len of cpu_load[0]: {len(cpu_load[0])}')
@@ -171,16 +183,25 @@ def main():
 
             # Save overall CPU load
             overall_output_path = args.output + "_overall.csv"
-            cpu_load_df.to_csv(overall_output_path, index=False)
+            with open(overall_output_path, "w") as f:
+                f.write("timestamp,cpu_load\n")
+                for i in range(len(timestamp)):
+                    f.write(f"{timestamp[i]},{cpu_load[-1][i]}\n")
             print(f"\nOverall CPU load data saved to {overall_output_path}")
 
             # Save per-CPU load
             per_core_output_path = args.output + "_per_core.csv"
-            cpu_load_per_core_df.to_csv(per_core_output_path, index=False)
+            with open(per_core_output_path, "w") as f:
+                f.write("timestamp,cpu_core,cpu_load\n")
+                for ucpu in range(num_cpus):
+                    for i in range(len(timestamp)):
+                        f.write(f"{timestamp[i]},{ucpu},{cpu_load[ucpu][i]}\n")
             print(f"Per-CPU load data saved to {per_core_output_path}")
         except Exception as e:
             print(f"Failed to save CSV files: {e}")
 
+    if not args.plot:
+        return
     try:
         import matplotlib.pyplot as plt
 
@@ -189,8 +210,8 @@ def main():
 
         # Plot Overall CPU Load
         axs[0].plot(
-            #cpu_load_df["window_start_ms"],
-            cpu_load[-1],
+            timestamp,
+            cpu_load[-2],
             marker="o",
             linestyle="-",
             color="blue",
@@ -203,7 +224,7 @@ def main():
         # Plot Per-CPU Load
         for ucpu in range(num_cpus):
             axs[1].plot(
-                #core_data["window_start_ms"],
+                timestamp,
                 cpu_load[ucpu],
                 marker="o",
                 linestyle="-",

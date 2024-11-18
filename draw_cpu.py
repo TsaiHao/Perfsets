@@ -1,6 +1,7 @@
 import os
 import argparse
 import math
+import time
 
 import pandas as pd
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
@@ -148,6 +149,12 @@ def main():
         required=True,
     )
     parser.add_argument(
+        "-p",
+        "--plot",
+        help="Plot the CPU load curves using matplotlib (optional)",
+        action="store_true",
+    )
+    parser.add_argument(
         "--window_size_ms",
         help="Window size in milliseconds. If not provided, calculated to have ~200 points.",
         type=int,
@@ -250,6 +257,7 @@ def main():
 
     # Calculate overall CPU load using sliding window with progress bar
     print("\nCalculating overall CPU load...")
+    start = time.time()
     cpu_load_df = calculate_cpu_load_sliding_window_base(
         df,
         window_size_ns=window_size_ns,
@@ -274,6 +282,9 @@ def main():
     print("Per-CPU Load Data Frame:")
     print(cpu_load_per_core_df.head())
 
+    end = time.time()
+    print(f'\nTime taken: {end - start:.2f} seconds')
+
     # Optionally save the CPU load DataFrames to CSV files
     if args.output:
         try:
@@ -294,6 +305,8 @@ def main():
         except Exception as e:
             print(f"Failed to save CSV files: {e}")
 
+    if not args.plot:
+        return
     # Optionally, plot the CPU load curves
     try:
         import matplotlib.pyplot as plt
